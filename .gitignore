@@ -1,0 +1,33 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.Python
+
+# ── Android / Gradle ─────────────────────────────────────────────────────────
+.gradle/
+.idea/
+android/build/
+android/app/build/
+*.iml
+local.properties
+*.jks
+*.keystore
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*~
+
+# ── Temp / Runtime ───────────────────────────────────────────────────────────
+/tmp/tetherlink_frame.png
+*.log
