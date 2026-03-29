@@ -5,15 +5,14 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- Stream display -->
-    <ImageView
-        android:id="@+id/frameView"
+    <!-- Stream surface — sized dynamically to match server resolution -->
+    <SurfaceView
+        android:id="@+id/surfaceView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:scaleType="fitCenter"
-        android:contentDescription="@null" />
+        android:layout_gravity="center" />
 
-    <!-- Shown while scanning / connecting -->
+    <!-- Loading overlay — hidden once connected -->
     <LinearLayout
         android:id="@+id/loadingOverlay"
         android:layout_width="wrap_content"
@@ -36,8 +35,21 @@
             android:layout_marginTop="16dp"
             android:text="Searching for server…"
             android:textColor="#FFFFFF"
-            android:textSize="16sp" />
+            android:textSize="16sp"
+            android:gravity="center" />
 
     </LinearLayout>
+
+    <!-- FPS counter — top-right corner, shown while streaming -->
+    <TextView
+        android:id="@+id/overlayFps"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_margin="12dp"
+        android:text="-- FPS"
+        android:textColor="#AAFFFFFF"
+        android:textSize="12sp"
+        android:visibility="gone" />
 
 </FrameLayout>
