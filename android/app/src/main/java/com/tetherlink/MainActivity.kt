@@ -129,13 +129,7 @@ class MainActivity : AppCompatActivity() {
             val streamH = input.readInt()
 
             withContext(Dispatchers.Main) {
-                // Size the SurfaceView to match the stream resolution exactly
-                val params = surfaceView.layoutParams
-                params.width  = streamW
-                params.height = streamH
-                surfaceView.layoutParams = params
-
-                // Hide loading overlay
+                // Keep SurfaceView full screen — we scale the bitmap to fill
                 findViewById<View>(R.id.loadingOverlay).visibility = View.GONE
                 overlayFps.visibility = View.VISIBLE
             }
@@ -187,7 +181,15 @@ class MainActivity : AppCompatActivity() {
         val holder: SurfaceHolder = surfaceView.holder
         val canvas: Canvas = holder.lockCanvas() ?: return
         try {
-            canvas.drawBitmap(bitmap, 0f, 0f, null)
+            // Scale bitmap to fill entire surface, preserving no aspect ratio
+            // (fills screen completely — matches extend display intent)
+            val dst = android.graphics.RectF(
+                0f, 0f,
+                canvas.width.toFloat(),
+                canvas.height.toFloat()
+            )
+            canvas.drawColor(android.graphics.Color.BLACK)
+            canvas.drawBitmap(bitmap, null, dst, null)
         } finally {
             holder.unlockCanvasAndPost(canvas)
         }

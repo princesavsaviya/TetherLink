@@ -1,10 +1,22 @@
 """
-TetherLink Server - Milestone 3: Wayland + PipeWire
-Uses the XDG ScreenCast portal to capture a monitor via PipeWire,
-then streams JPEG frames to the Android tablet over TCP.
+TetherLink Server - Milestone 4: True Virtual Display via Mutter ScreenCast
+Uses org.gnome.Mutter.ScreenCast to create a real virtual monitor at the
+target resolution, then captures it via PipeWire and streams to Android.
+
+No user permission dialog. GNOME treats the virtual display as a real
+second monitor — you can drag windows onto it, set wallpaper, etc.
+
+Flow:
+  Mutter.ScreenCast.CreateSession()
+    → session.RecordVirtual(width, height)   ← creates real virtual monitor
+    → stream.Start()
+    → PipeWireStreamAdded(node_id)
+    → GStreamer pipewiresrc path=node_id
+    → BGR frames → JPEG → TCP → Android
 
 Usage:
     python server/tetherlink_server.py
+    python server/tetherlink_server.py --width 2960 --height 1848
     python server/tetherlink_server.py --fps 60 --quality 70
 
 Protocol:
@@ -14,10 +26,7 @@ Protocol:
 
 import argparse
 import logging
-import os
-import random
 import socket
-import string
 import struct
 import threading
 import time
@@ -31,12 +40,18 @@ from gi.repository import GLib, Gst
 from PIL import Image
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description="TetherLink PipeWire Server")
+parser = argparse.ArgumentParser(description="TetherLink Virtual Display Server")
+parser.add_argument("--width",   type=int, default=2960,
+                    help="Virtual display width  (default: 2960)")
+parser.add_argument("--height",  type=int, default=1848,
+                    help="Virtual display height (default: 1848)")
 parser.add_argument("--fps",     type=int, default=30)
 parser.add_argument("--quality", type=int, default=80)
 parser.add_argument("--port",    type=int, default=8080)
 args = parser.parse_args()
 
+WIDTH          = args.width
+HEIGHT         = args.height
 FPS            = args.fps
 JPEG_QUALITY   = args.quality
 PORT           = args.port
@@ -50,155 +65,119 @@ logging.basicConfig(
 )
 log = logging.getLogger("TetherLink")
 
+MUTTER_BUS      = "org.gnome.Mutter.ScreenCast"
+MUTTER_PATH     = "/org/gnome/Mutter/ScreenCast"
+MUTTER_SC_IF    = "org.gnome.Mutter.ScreenCast"
+MUTTER_SES_IF   = "org.gnome.Mutter.ScreenCast.Session"
+MUTTER_STR_IF   = "org.gnome.Mutter.ScreenCast.Stream"
 
-# ── XDG ScreenCast portal ─────────────────────────────────────────────────────
 
-class ScreenCastPortal:
+# ── Mutter ScreenCast virtual display ────────────────────────────────────────
+
+class MutterVirtualDisplay:
     """
-    Async GLib-based portal flow matching the working test script exactly.
-    Uses bus.add_signal_receiver() and GLib.idle_add() for sequencing.
+    Creates a real virtual monitor via org.gnome.Mutter.ScreenCast.
+    GNOME treats it as a second physical display.
+
+    Sequence:
+      1. CreateSession
+      2. session.RecordVirtual(width, height)
+      3. stream.Start()
+      4. Wait for PipeWireStreamAdded signal → get node_id
     """
 
-    PORTAL_BUS  = "org.freedesktop.portal.Desktop"
-    PORTAL_PATH = "/org/freedesktop/portal/desktop"
-    PORTAL_IF   = "org.freedesktop.portal.ScreenCast"
-    REQUEST_IF  = "org.freedesktop.portal.Request"
-    REQUEST_BASE = "/org/freedesktop/portal/desktop/request"
+    def __init__(self, width: int, height: int):
+        self.width    = width
+        self.height   = height
+        self._node_id = None
+        self._error   = None
 
-    def __init__(self):
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-        self._bus   = dbus.SessionBus()
-        self._loop  = GLib.MainLoop()
-        self._state = {
-            "session_handle": None,
-            "node_id":        None,
-            "width":          1920,
-            "height":         1080,
-            "error":          None,
-        }
+        self._bus  = dbus.SessionBus()
+        self._loop = GLib.MainLoop()
 
-        # Stable token prefix for this run
-        suffix = "".join(random.choices(string.ascii_lowercase, k=6))
-        self._prefix      = f"tl{suffix}"
-        self._sender_name = (
-            self._bus.get_unique_name().replace(".", "_").replace(":", "")
+        sc_obj     = self._bus.get_object(MUTTER_BUS, MUTTER_PATH)
+        self._sc   = dbus.Interface(sc_obj, MUTTER_SC_IF)
+
+        self._session_path = None
+        self._stream_path  = None
+
+    def _on_pipewire_stream_added(self, node_id):
+        self._node_id = int(node_id)
+        log.info("PipeWire stream ready — node_id: %d", self._node_id)
+        self._loop.quit()
+
+    def _on_session_closed(self):
+        log.warning("Mutter session closed unexpectedly")
+        self._error = "Session closed"
+        self._loop.quit()
+
+    def setup(self) -> int:
+        """
+        Run the full setup flow.
+        Returns the PipeWire node_id for the virtual display.
+        """
+        # ── 1. CreateSession ──────────────────────────────────────────────────
+        log.info("Creating Mutter ScreenCast session...")
+        self._session_path = str(self._sc.CreateSession(
+            dbus.Dictionary({}, signature="sv")
+        ))
+        log.info("Session: %s", self._session_path)
+
+        session_obj = self._bus.get_object(MUTTER_BUS, self._session_path)
+        session     = dbus.Interface(session_obj, MUTTER_SES_IF)
+
+        # Subscribe to Closed signal
+        session_obj.connect_to_signal(
+            "Closed", self._on_session_closed,
+            dbus_interface=MUTTER_SES_IF,
         )
 
-        desktop = self._bus.get_object(self.PORTAL_BUS, self.PORTAL_PATH)
-        self._sc = dbus.Interface(desktop, self.PORTAL_IF)
-
-    def _req_path(self, token: str) -> str:
-        return f"{self.REQUEST_BASE}/{self._sender_name}/{token}"
-
-    def _subscribe(self, token: str, callback):
-        self._bus.add_signal_receiver(
-            callback,
-            signal_name="Response",
-            dbus_interface=self.REQUEST_IF,
-            path=self._req_path(token),
-        )
-
-    # ── Step 1 ────────────────────────────────────────────────────────────────
-    def _create_session(self):
-        log.info("Portal: CreateSession...")
-        token = f"{self._prefix}_create"
-
-        def on_response(code, results):
-            if code != 0:
-                self._state["error"] = f"CreateSession denied (code={code})"
-                self._loop.quit()
-                return
-            self._state["session_handle"] = str(results["session_handle"])
-            log.info("Session: %s", self._state["session_handle"])
-            GLib.idle_add(self._select_sources)
-
-        self._subscribe(token, on_response)
-        self._sc.CreateSession(dbus.Dictionary({
-            "handle_token":        dbus.String(token),
-            "session_handle_token": dbus.String(f"{self._prefix}_session"),
-        }, signature="sv"))
-
-    # ── Step 2 ────────────────────────────────────────────────────────────────
-    def _select_sources(self):
-        log.info("Portal: SelectSources...")
-        token = f"{self._prefix}_select"
-
-        def on_response(code, results):
-            if code != 0:
-                self._state["error"] = f"SelectSources denied (code={code})"
-                self._loop.quit()
-                return
-            GLib.idle_add(self._start)
-
-        self._subscribe(token, on_response)
-        self._sc.SelectSources(
-            dbus.ObjectPath(self._state["session_handle"]),
+        # ── 2. RecordVirtual ──────────────────────────────────────────────────
+        log.info("Creating virtual monitor %dx%d...", self.width, self.height)
+        self._stream_path = str(session.RecordVirtual(
             dbus.Dictionary({
-                "handle_token": dbus.String(token),
-                "types":        dbus.UInt32(1),      # monitor
-                "multiple":     dbus.Boolean(False),
-                "cursor_mode":  dbus.UInt32(2),      # embedded
+                "size": dbus.Struct(
+                    (dbus.Int32(self.width), dbus.Int32(self.height)),
+                    signature="ii"
+                ),
+                "cursor-mode": dbus.UInt32(1),  # 1=embedded cursor in stream
             }, signature="sv")
+        ))
+        log.info("Stream: %s", self._stream_path)
+
+        stream_obj = self._bus.get_object(MUTTER_BUS, self._stream_path)
+
+        # Subscribe to PipeWireStreamAdded BEFORE calling Start
+        stream_obj.connect_to_signal(
+            "PipeWireStreamAdded", self._on_pipewire_stream_added,
+            dbus_interface=MUTTER_STR_IF,
         )
 
-    # ── Step 3 ────────────────────────────────────────────────────────────────
-    def _start(self):
-        log.info("Portal: Start — select your monitor and click Share...")
-        token = f"{self._prefix}_start"
+        # ── 3. Start session — this starts all streams automatically ─────────
+        log.info("Starting session (streams start automatically)...")
+        stream = dbus.Interface(stream_obj, MUTTER_STR_IF)
+        session.Start()
 
-        def on_response(code, results):
-            if code != 0:
-                self._state["error"] = f"Start denied (code={code})"
-                self._loop.quit()
-                return
-            streams = results.get("streams", [])
-            if not streams:
-                self._state["error"] = "No streams returned"
-                self._loop.quit()
-                return
-            node_id, props = streams[0]
-            self._state["node_id"] = int(node_id)
-            size = props.get("size", None)
-            if size:
-                self._state["width"]  = int(size[0])
-                self._state["height"] = int(size[1])
-            log.info("PipeWire node: %d  (%dx%d)",
-                     self._state["node_id"],
-                     self._state["width"],
-                     self._state["height"])
+        # Wait for PipeWireStreamAdded (timeout 10s)
+        GLib.timeout_add(10_000, lambda: (
+            setattr(self, "_error", "Timeout waiting for PipeWire stream"),
             self._loop.quit()
-
-        self._subscribe(token, on_response)
-        self._sc.Start(
-            dbus.ObjectPath(self._state["session_handle"]),
-            dbus.String(""),
-            dbus.Dictionary({
-                "handle_token": dbus.String(token),
-            }, signature="sv")
-        )
-
-    def acquire(self) -> tuple[int, int, int]:
-        GLib.timeout_add(120_000, lambda: (self._loop.quit(), False)[1])
-        GLib.idle_add(self._create_session)
+        ))
         self._loop.run()
 
-        if self._state["error"]:
-            raise RuntimeError(self._state["error"])
-        if self._state["node_id"] is None:
-            raise RuntimeError("Portal flow completed but no node_id obtained")
+        if self._error:
+            raise RuntimeError(self._error)
+        if self._node_id is None:
+            raise RuntimeError("No PipeWire node_id received")
 
-        return (
-            self._state["node_id"],
-            self._state["width"],
-            self._state["height"],
-        )
+        return self._node_id
 
     def close(self):
-        h = self._state.get("session_handle")
-        if h:
+        if self._session_path:
             try:
-                obj = self._bus.get_object(self.PORTAL_BUS, h)
-                dbus.Interface(obj, "org.freedesktop.portal.Session").Close()
+                obj = self._bus.get_object(MUTTER_BUS, self._session_path)
+                dbus.Interface(obj, MUTTER_SES_IF).Stop()
             except Exception:
                 pass
 
@@ -222,7 +201,8 @@ class PipeWireCapture:
             f"pipewiresrc path={node_id} always-copy=true "
             f"! videoconvert "
             f"! video/x-raw,format=BGR "
-            f"! appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false"
+            f"! appsink name=sink emit-signals=true "
+            f"max-buffers=2 drop=true sync=false"
         )
         log.info("GStreamer: %s", pipeline_str)
         self._pipeline = Gst.parse_launch(pipeline_str)
@@ -314,18 +294,22 @@ def stream_to_client(conn: socket.socket, addr: tuple,
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run_server():
-    log.info("TetherLink M3 — Wayland + PipeWire")
-    log.info("Select your monitor in the GNOME dialog and click Share")
+    log.info("TetherLink M4 — Virtual Display via Mutter ScreenCast")
+    log.info("Creating virtual monitor %dx%d...", WIDTH, HEIGHT)
 
-    portal = ScreenCastPortal()
+    display = MutterVirtualDisplay(WIDTH, HEIGHT)
     try:
-        node_id, w, h = portal.acquire()
+        node_id = display.setup()
     except Exception as e:
-        log.error("Portal error: %s", e)
-        portal.close()
+        log.error("Virtual display setup failed: %s", e)
+        display.close()
         raise SystemExit(1)
 
-    capture = PipeWireCapture(node_id, w, h)
+    log.info("Virtual display ready! Check GNOME display settings — "
+             "you should see a second monitor.")
+    log.info("Drag windows onto it to see them on the tablet.")
+
+    capture = PipeWireCapture(node_id, WIDTH, HEIGHT)
     time.sleep(0.5)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
@@ -345,7 +329,7 @@ def run_server():
             log.info("Shutting down...")
         finally:
             capture.close()
-            portal.close()
+            display.close()
 
 
 if __name__ == "__main__":
