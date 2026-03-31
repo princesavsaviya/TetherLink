@@ -24,6 +24,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import android.content.Intent
+import android.content.SharedPreferences
 import org.json.JSONObject
 import java.io.DataInputStream
 import java.net.DatagramPacket
@@ -61,6 +63,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var connectButton:    Button
     private lateinit var onboardingLayout: View
 
+    private lateinit var prefs: SharedPreferences
     private val ioScope   = CoroutineScope(Dispatchers.IO)
     private var streamJob: Job? = null
     private var listenJob: Job? = null
@@ -89,6 +92,7 @@ class MainActivity : AppCompatActivity() {
         connectButton    = findViewById(R.id.connectButton)
         onboardingLayout = findViewById(R.id.onboardingLayout)
 
+        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableImmersiveMode()
 
@@ -108,6 +112,10 @@ class MainActivity : AppCompatActivity() {
         connectButton.setOnClickListener {
             val ip = discoveredIp ?: return@setOnClickListener
             startStreaming(ip)
+        }
+
+        findViewById<android.widget.ImageButton>(R.id.settingsBtn).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
         }
 
         // ── Onboarding ────────────────────────────────────────────────────────
@@ -269,28 +277,57 @@ class MainActivity : AppCompatActivity() {
                 val streamH = input.readInt()
                 showToast("Connected to $discoveredName — ${streamW}×${streamH}")
 
-                val opts = BitmapFactory.Options().apply { inMutable = true }
-                var reuseBitmap: Bitmap? = null
+                // Keep-alive: detect silent disconnects within 3s
+                socket.soTimeout = 3000
+
+                // Pre-allocate reusable buffer — avoids GC at 60 FPS
+                var readBuf   = ByteArray(1024 * 1024) // 1MB initial
+                val opts      = BitmapFactory.Options().apply { inMutable = true }
+                var bitmap1: Bitmap? = null
+                var bitmap2: Bitmap? = null
+                var lastFrameTime = System.currentTimeMillis()
+
+                // Separate render coroutine so decode never blocks draw
+                val latestBitmap = java.util.concurrent.atomic.AtomicReference<Bitmap?>()
+                val renderJob = kotlinx.coroutines.GlobalScope.launch(Dispatchers.Main) {
+                    while (streamJob?.isActive == true) {
+                        val bmp = latestBitmap.getAndSet(null)
+                        if (bmp != null) drawFrame(bmp)
+                        kotlinx.coroutines.delay(1)
+                    }
+                }
 
                 while (streamJob?.isActive == true) {
-                    val frameSize = input.readInt()
+                    val frameSize = try {
+                        input.readInt()
+                    } catch (e: java.net.SocketTimeoutException) {
+                        val silentMs = System.currentTimeMillis() - lastFrameTime
+                        if (silentMs > 3000) throw Exception("No frames for ${silentMs/1000}s")
+                        continue
+                    }
                     if (frameSize <= 0) continue
 
-                    val buf = ByteArray(frameSize)
-                    input.readFully(buf)
+                    // Reuse buffer if big enough, else reallocate
+                    if (readBuf.size < frameSize) readBuf = ByteArray(frameSize)
+                    input.readFully(readBuf, 0, frameSize)
+                    lastFrameTime = System.currentTimeMillis()
 
-                    opts.inBitmap = reuseBitmap
-                    val bitmap = try {
-                        BitmapFactory.decodeByteArray(buf, 0, frameSize, opts)
+                    // Alternate between two bitmaps to avoid alloc
+                    val prev = latestBitmap.get()
+                    opts.inBitmap = if (prev == bitmap1) bitmap2 else bitmap1
+                    val decoded = try {
+                        BitmapFactory.decodeByteArray(readBuf, 0, frameSize, opts)
                     } catch (_: IllegalArgumentException) {
                         opts.inBitmap = null
-                        BitmapFactory.decodeByteArray(buf, 0, frameSize, opts)
+                        BitmapFactory.decodeByteArray(readBuf, 0, frameSize, opts)
                     } ?: continue
 
-                    reuseBitmap = bitmap
-                    drawFrame(bitmap)
+                    // Track which bitmap we just decoded into
+                    if (opts.inBitmap == bitmap1) bitmap1 = decoded else bitmap2 = decoded
+                    latestBitmap.set(decoded)
                     updateFps()
                 }
+                renderJob.cancel()
                 socket.close()
 
             } catch (e: Exception) {

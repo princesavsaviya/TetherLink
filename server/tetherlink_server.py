@@ -47,8 +47,8 @@ parser.add_argument("--width",   type=int, default=2960,
                     help="Virtual display width  (default: 2960)")
 parser.add_argument("--height",  type=int, default=1848,
                     help="Virtual display height (default: 1848)")
-parser.add_argument("--fps",     type=int, default=30)
-parser.add_argument("--quality", type=int, default=100)
+parser.add_argument("--fps",     type=int, default=60)
+parser.add_argument("--quality", type=int, default=90)
 parser.add_argument("--port",    type=int, default=8080)
 args = parser.parse_args()
 

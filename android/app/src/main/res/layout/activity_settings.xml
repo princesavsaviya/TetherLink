@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:background="#121212">
+
+    <!-- FPS setting -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Performance"
+        android:textColor="#88FFFFFF"
+        android:textSize="12sp"
+        android:letterSpacing="0.1"
+        android:layout_marginBottom="12dp"
+        android:layout_marginTop="8dp" />
+
+    <TextView
+        android:id="@+id/fpsLabel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Target FPS: 60"
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        android:layout_marginBottom="8dp" />
+
+    <SeekBar
+        android:id="@+id/fpsSeekBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="8dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Higher FPS = smoother but uses more CPU"
+        android:textColor="#88FFFFFF"
+        android:textSize="12sp"
+        android:layout_marginBottom="32dp" />
+
+    <!-- Quality setting -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Quality"
+        android:textColor="#88FFFFFF"
+        android:textSize="12sp"
+        android:letterSpacing="0.1"
+        android:layout_marginBottom="12dp" />
+
+    <TextView
+        android:id="@+id/qualityLabel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="JPEG Quality: 90 — Sharp"
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        android:layout_marginBottom="8dp" />
+
+    <SeekBar
+        android:id="@+id/qualitySeekBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="8dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Higher quality = sharper image but more data per frame"
+        android:textColor="#88FFFFFF"
+        android:textSize="12sp"
+        android:layout_marginBottom="32dp" />
+
+    <!-- Note -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="⚠️ Changes take effect on next connection"
+        android:textColor="#FFC107"
+        android:textSize="13sp" />
+
+</LinearLayout>
