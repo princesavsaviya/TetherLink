@@ -7,15 +7,20 @@ import android.os.Bundle
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -26,17 +31,18 @@ import java.net.InetSocketAddress
 import java.net.Socket
 
 /**
- * TetherLink – Main Activity
+ * TetherLink – Main Activity (v0.5.0)
  *
- * Discovery flow:
- *   1. Listen on UDP 8765 for server broadcast
- *   2. Show "Connect" button with server name + resolution
- *   3. User taps Connect → TCP stream starts
+ * Batch 1 UX improvements:
+ *  - Keep screen on while streaming (FLAG_KEEP_SCREEN_ON)
+ *  - True fullscreen immersive mode (hides nav bar + status bar)
+ *  - Auto-reconnect on disconnect (returns to discovery, reconnects automatically)
  */
 class MainActivity : AppCompatActivity() {
 
     private val SERVER_PORT    = 8080
     private val DISCOVERY_PORT = 8765
+    private val AUTO_RECONNECT_DELAY_MS = 2000L
 
     // ── Views ─────────────────────────────────────────────────────────────────
     private lateinit var surfaceView:     SurfaceView
@@ -52,12 +58,10 @@ class MainActivity : AppCompatActivity() {
     private var streamJob: Job? = null
     private var listenJob: Job? = null
 
-    // Discovered server info
     private var discoveredIp:   String? = null
     private var discoveredName: String  = "TetherLink Server"
     private var discoveredRes:  String  = ""
 
-    // FPS tracking
     private var frameCount  = 0
     private var fpsLastTime = System.currentTimeMillis()
 
@@ -74,6 +78,12 @@ class MainActivity : AppCompatActivity() {
         serverInfoText  = findViewById(R.id.serverInfoText)
         connectButton   = findViewById(R.id.connectButton)
 
+        // ── 1. Keep screen on ─────────────────────────────────────────────────
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // ── 2. True fullscreen immersive mode ─────────────────────────────────
+        enableImmersiveMode()
+
         connectButton.setOnClickListener {
             val ip = discoveredIp ?: return@setOnClickListener
             startStreaming(ip)
@@ -82,16 +92,39 @@ class MainActivity : AppCompatActivity() {
         startDiscoveryListener()
     }
 
+    // ── Immersive mode ────────────────────────────────────────────────────────
+
+    private fun enableImmersiveMode() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+    }
+
+    // Re-apply immersive mode if system bars reappear (e.g. after dialog)
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) enableImmersiveMode()
+    }
+
     // ── UDP Discovery ─────────────────────────────────────────────────────────
 
-    private fun startDiscoveryListener() {
+    private fun startDiscoveryListener(autoConnectIp: String? = null) {
+        listenJob?.cancel()
         listenJob = ioScope.launch {
             setStatus("Searching for TetherLink server…")
             showProgress(true)
 
+            // Auto-reconnect: if we know the last server IP, connect immediately
+            // when we see its broadcast again
+            var autoConnect = autoConnectIp
+
             try {
                 val socket = DatagramSocket(DISCOVERY_PORT)
                 socket.broadcast = true
+                socket.soTimeout = 0
                 val buf    = ByteArray(1024)
                 val packet = DatagramPacket(buf, buf.size)
 
@@ -106,7 +139,20 @@ class MainActivity : AppCompatActivity() {
                     val name = json.optString("name", "TetherLink Server")
                     val res  = json.optString("resolution", "")
 
-                    // Only update UI if server changed
+                    // Auto-reconnect if this is the server we were connected to
+                    if (autoConnect != null && ip == autoConnect) {
+                        autoConnect = null
+                        withContext(Dispatchers.Main) {
+                            discoveredIp   = ip
+                            discoveredName = name
+                            discoveredRes  = res
+                        }
+                        setStatus("Reconnecting to $name…")
+                        delay(500)
+                        startStreaming(ip)
+                        break
+                    }
+
                     if (ip != discoveredIp) {
                         discoveredIp   = ip
                         discoveredName = name
@@ -136,13 +182,13 @@ class MainActivity : AppCompatActivity() {
     // ── Streaming ─────────────────────────────────────────────────────────────
 
     private fun startStreaming(ip: String) {
-        // Hide discovery UI, show surface
-        discoveryLayout.visibility = View.GONE
-        surfaceView.visibility     = View.VISIBLE
-        overlayFps.visibility      = View.VISIBLE
         listenJob?.cancel()
-
         streamJob = ioScope.launch {
+            withContext(Dispatchers.Main) {
+                discoveryLayout.visibility = View.GONE
+                surfaceView.visibility     = View.VISIBLE
+                overlayFps.visibility      = View.VISIBLE
+            }
             try {
                 val socket = Socket()
                 socket.connect(InetSocketAddress(ip, SERVER_PORT), 5000)
@@ -175,21 +221,22 @@ class MainActivity : AppCompatActivity() {
                     drawFrame(bitmap)
                     updateFps()
                 }
-
                 socket.close()
 
             } catch (e: Exception) {
+                // ── 3. Auto-reconnect ─────────────────────────────────────────
+                val lastIp = ip
                 withContext(Dispatchers.Main) {
-                    // Return to discovery screen on disconnect
                     surfaceView.visibility     = View.GONE
                     overlayFps.visibility      = View.GONE
                     discoveryLayout.visibility = View.VISIBLE
                     connectButton.visibility   = View.GONE
                     discoveredIp               = null
                 }
-                setStatus("Disconnected — searching again…")
-                showProgress(true)
-                startDiscoveryListener()
+                setStatus("Disconnected — reconnecting in ${AUTO_RECONNECT_DELAY_MS/1000}s…")
+                delay(AUTO_RECONNECT_DELAY_MS)
+                // Pass last IP so we auto-connect when we see it broadcast again
+                startDiscoveryListener(autoConnectIp = lastIp)
             }
         }
     }
