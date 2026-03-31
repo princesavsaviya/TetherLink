@@ -20,6 +20,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -320,7 +321,7 @@ class MainActivity : AppCompatActivity() {
                 // ── 3-way HMAC handshake ─────────────────────────────
                 val secret = getStoredSecret()
                 if (secret == null) {
-                    throw Exception("Not paired. Scan the QR code on your PC first.")
+                    throw Exception("Not paired. Tap '🔗 Pair with PC' first.")
                 }
 
                 // Step 1: Send HELLO + device_id + device_name
@@ -342,7 +343,7 @@ class MainActivity : AppCompatActivity() {
                 socket.getOutputStream().write(MAGIC_RESPONSE + hmacBytes)
                 socket.getOutputStream().flush()
 
-                // Step 4: Receive OK or REJECT
+                // Step 4: Receive OK + resolution + codec
                 val resultHeader = ByteArray(6)
                 input.readFully(resultHeader)
                 if (resultHeader.contentEquals(MAGIC_REJECT)) {
@@ -355,20 +356,53 @@ class MainActivity : AppCompatActivity() {
 
                 val streamW = input.readInt()
                 val streamH = input.readInt()
-                showToast("Connected to $discoveredName — ${streamW}×${streamH}")
+                val codecId = input.read()  // 1=H264, 2=JPEG
+                val codecName = if (codecId == 1) "H.264" else "JPEG"
+                showToast("Connected to $discoveredName — ${streamW}×${streamH} $codecName")
 
                 // Keep-alive: detect silent disconnects within 3s
                 socket.soTimeout = 3000
 
-                // Pre-allocate reusable buffer — avoids GC at 60 FPS
-                var readBuf   = ByteArray(1024 * 1024) // 1MB initial
-                val opts      = BitmapFactory.Options().apply { inMutable = true }
-                var bitmap1: Bitmap? = null
-                var bitmap2: Bitmap? = null
-                var lastFrameTime = System.currentTimeMillis()
+                // Use SurfaceHolder.Callback to wait for the surface to be
+                // created/ready AFTER surfaceView becomes visible
+                val surfaceReady = CompletableDeferred<android.view.Surface>()
+                withContext(Dispatchers.Main) {
+                    if (surfaceView.holder.surface.isValid) {
+                        // Surface already valid (e.g. reconnect)
+                        surfaceReady.complete(surfaceView.holder.surface)
+                    } else {
+                        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+                            override fun surfaceCreated(h: SurfaceHolder) {
+                                surfaceView.holder.removeCallback(this)
+                                surfaceReady.complete(h.surface)
+                            }
+                            override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, h2: Int) {}
+                            override fun surfaceDestroyed(h: SurfaceHolder) {
+                                if (!surfaceReady.isCompleted)
+                                    surfaceReady.completeExceptionally(Exception("Surface destroyed"))
+                            }
+                        })
+                    }
+                }
 
-                // Separate render coroutine so decode never blocks draw
+                // Wait up to 5 seconds for surface
+                val surface = withContext(Dispatchers.IO) {
+                    kotlinx.coroutines.withTimeout(5000) { surfaceReady.await() }
+                }
+
+                // Initialize decoder based on codec
                 val latestBitmap = java.util.concurrent.atomic.AtomicReference<Bitmap?>()
+                val decoder = StreamDecoder(
+                    surface  = surface,
+                    codec    = codecId,
+                    width    = streamW,
+                    height   = streamH,
+                    onBitmap = { bmp -> latestBitmap.set(bmp) }
+                )
+
+
+
+                // Render coroutine for JPEG mode
                 val renderJob = kotlinx.coroutines.GlobalScope.launch(Dispatchers.Main) {
                     while (streamJob?.isActive == true) {
                         val bmp = latestBitmap.getAndSet(null)
@@ -376,6 +410,9 @@ class MainActivity : AppCompatActivity() {
                         kotlinx.coroutines.delay(1)
                     }
                 }
+
+                var readBuf       = ByteArray(1024 * 1024)
+                var lastFrameTime = System.currentTimeMillis()
 
                 while (streamJob?.isActive == true) {
                     val frameSize = try {
@@ -387,27 +424,16 @@ class MainActivity : AppCompatActivity() {
                     }
                     if (frameSize <= 0) continue
 
-                    // Reuse buffer if big enough, else reallocate
                     if (readBuf.size < frameSize) readBuf = ByteArray(frameSize)
                     input.readFully(readBuf, 0, frameSize)
                     lastFrameTime = System.currentTimeMillis()
 
-                    // Alternate between two bitmaps to avoid alloc
-                    val prev = latestBitmap.get()
-                    opts.inBitmap = if (prev == bitmap1) bitmap2 else bitmap1
-                    val decoded = try {
-                        BitmapFactory.decodeByteArray(readBuf, 0, frameSize, opts)
-                    } catch (_: IllegalArgumentException) {
-                        opts.inBitmap = null
-                        BitmapFactory.decodeByteArray(readBuf, 0, frameSize, opts)
-                    } ?: continue
-
-                    // Track which bitmap we just decoded into
-                    if (opts.inBitmap == bitmap1) bitmap1 = decoded else bitmap2 = decoded
-                    latestBitmap.set(decoded)
+                    decoder.decodeFrame(readBuf.copyOf(frameSize))
                     updateFps()
                 }
+
                 renderJob.cancel()
+                decoder.release()
                 socket.close()
 
             } catch (e: Exception) {
@@ -428,8 +454,12 @@ class MainActivity : AppCompatActivity() {
             qualityDot.visibility       = View.GONE
             discoveryLayout.visibility  = View.VISIBLE
             connectButton.visibility    = View.GONE
+            serverNameText.text         = ""
+            serverInfoText.text         = ""
             discoveredIp                = null
         }
+        // Restart discovery so Connect button reappears when server is found
+        startDiscoveryListener()
     }
 
     // ── Rendering ─────────────────────────────────────────────────────────────
