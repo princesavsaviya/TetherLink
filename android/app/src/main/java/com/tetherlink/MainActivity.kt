@@ -1,5 +1,6 @@
 package com.tetherlink
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -31,28 +32,34 @@ import java.net.InetSocketAddress
 import java.net.Socket
 
 /**
- * TetherLink – Main Activity (v0.5.0)
+ * TetherLink – Main Activity (v0.6.0)
  *
- * Batch 1 UX improvements:
- *  - Keep screen on while streaming (FLAG_KEEP_SCREEN_ON)
- *  - True fullscreen immersive mode (hides nav bar + status bar)
- *  - Auto-reconnect on disconnect (returns to discovery, reconnects automatically)
+ * Batch 2 UX improvements:
+ *  - Connection quality indicator (green/yellow/red dot based on FPS)
+ *  - Disconnect button (swipe down from top to reveal, tap to disconnect)
+ *  - Onboarding screen (shown on first launch with setup instructions)
  */
 class MainActivity : AppCompatActivity() {
 
-    private val SERVER_PORT    = 8080
-    private val DISCOVERY_PORT = 8765
+    private val SERVER_PORT             = 8080
+    private val DISCOVERY_PORT          = 8765
     private val AUTO_RECONNECT_DELAY_MS = 2000L
+    private val PREFS_NAME              = "tetherlink"
+    private val PREF_ONBOARDED          = "onboarded"
 
     // ── Views ─────────────────────────────────────────────────────────────────
-    private lateinit var surfaceView:     SurfaceView
-    private lateinit var overlayFps:      TextView
-    private lateinit var discoveryLayout: View
-    private lateinit var statusText:      TextView
-    private lateinit var progressBar:     ProgressBar
-    private lateinit var serverNameText:  TextView
-    private lateinit var serverInfoText:  TextView
-    private lateinit var connectButton:   Button
+    private lateinit var surfaceView:      SurfaceView
+    private lateinit var overlayFps:       TextView
+    private lateinit var qualityDot:       View
+    private lateinit var disconnectBtn:    Button
+    private lateinit var streamOverlay:    View
+    private lateinit var discoveryLayout:  View
+    private lateinit var statusText:       TextView
+    private lateinit var progressBar:      ProgressBar
+    private lateinit var serverNameText:   TextView
+    private lateinit var serverInfoText:   TextView
+    private lateinit var connectButton:    Button
+    private lateinit var onboardingLayout: View
 
     private val ioScope   = CoroutineScope(Dispatchers.IO)
     private var streamJob: Job? = null
@@ -69,27 +76,63 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        surfaceView     = findViewById(R.id.surfaceView)
-        overlayFps      = findViewById(R.id.overlayFps)
-        discoveryLayout = findViewById(R.id.discoveryLayout)
-        statusText      = findViewById(R.id.statusText)
-        progressBar     = findViewById(R.id.progressBar)
-        serverNameText  = findViewById(R.id.serverNameText)
-        serverInfoText  = findViewById(R.id.serverInfoText)
-        connectButton   = findViewById(R.id.connectButton)
+        surfaceView      = findViewById(R.id.surfaceView)
+        overlayFps       = findViewById(R.id.overlayFps)
+        qualityDot       = findViewById(R.id.qualityDot)
+        disconnectBtn    = findViewById(R.id.disconnectBtn)
+        streamOverlay    = findViewById(R.id.streamOverlay)
+        discoveryLayout  = findViewById(R.id.discoveryLayout)
+        statusText       = findViewById(R.id.statusText)
+        progressBar      = findViewById(R.id.progressBar)
+        serverNameText   = findViewById(R.id.serverNameText)
+        serverInfoText   = findViewById(R.id.serverInfoText)
+        connectButton    = findViewById(R.id.connectButton)
+        onboardingLayout = findViewById(R.id.onboardingLayout)
 
-        // ── 1. Keep screen on ─────────────────────────────────────────────────
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-        // ── 2. True fullscreen immersive mode ─────────────────────────────────
         enableImmersiveMode()
+
+        // ── Disconnect button ─────────────────────────────────────────────────
+        disconnectBtn.setOnClickListener {
+            streamJob?.cancel()
+            showDiscoveryScreen()
+        }
+
+        // ── Stream overlay toggle (swipe down to show/hide disconnect button) ─
+        surfaceView.setOnClickListener {
+            streamOverlay.visibility =
+                if (streamOverlay.visibility == View.VISIBLE) View.GONE
+                else View.VISIBLE
+        }
 
         connectButton.setOnClickListener {
             val ip = discoveredIp ?: return@setOnClickListener
             startStreaming(ip)
         }
 
-        startDiscoveryListener()
+        // ── Onboarding ────────────────────────────────────────────────────────
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(PREF_ONBOARDED, false)) {
+            showOnboarding()
+        } else {
+            discoveryLayout.visibility = View.VISIBLE
+            startDiscoveryListener()
+        }
+
+        findViewById<Button>(R.id.onboardingDoneBtn).setOnClickListener {
+            prefs.edit().putBoolean(PREF_ONBOARDED, true).apply()
+            onboardingLayout.visibility = View.GONE
+            discoveryLayout.visibility  = View.VISIBLE
+            startDiscoveryListener()
+        }
+    }
+
+    // ── Onboarding ────────────────────────────────────────────────────────────
+
+    private fun showOnboarding() {
+        onboardingLayout.visibility = View.VISIBLE
+        discoveryLayout.visibility  = View.GONE
+        surfaceView.visibility      = View.GONE
     }
 
     // ── Immersive mode ────────────────────────────────────────────────────────
@@ -103,28 +146,55 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Re-apply immersive mode if system bars reappear (e.g. after dialog)
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) enableImmersiveMode()
     }
 
-    // ── UDP Discovery ─────────────────────────────────────────────────────────
+    // ── Discovery ─────────────────────────────────────────────────────────────
+
+    /**
+     * Returns true if the given IP belongs to a USB tethering interface.
+     * Excludes WiFi (wlan) interfaces to enforce USB-only mode.
+     */
+    private fun isUsbTetherIp(ip: String): Boolean {
+        return try {
+            java.net.NetworkInterface.getNetworkInterfaces()
+                ?.asSequence()
+                ?.filter { iface ->
+                    // Exclude loopback and WiFi interfaces
+                    !iface.isLoopback && iface.isUp &&
+                            !iface.name.startsWith("wlan") &&
+                            !iface.name.startsWith("p2p")
+                }
+                ?.flatMap { iface ->
+                    iface.inetAddresses.asSequence()
+                        .filterIsInstance<java.net.Inet4Address>()
+                        .filter { !it.isLoopbackAddress }
+                        .map { it.hostAddress }
+                }
+                ?.any { addr ->
+                    // Check if IP is on same /24 subnet as this USB interface
+                    val parts1 = addr?.split(".") ?: return@any false
+                    val parts2 = ip.split(".")
+                    parts1.size == 4 && parts2.size == 4 &&
+                            parts1[0] == parts2[0] &&
+                            parts1[1] == parts2[1] &&
+                            parts1[2] == parts2[2]
+                } ?: false
+        } catch (_: Exception) { true } // allow if check fails
+    }
 
     private fun startDiscoveryListener(autoConnectIp: String? = null) {
         listenJob?.cancel()
         listenJob = ioScope.launch {
             setStatus("Searching for TetherLink server…")
             showProgress(true)
-
-            // Auto-reconnect: if we know the last server IP, connect immediately
-            // when we see its broadcast again
             var autoConnect = autoConnectIp
 
             try {
                 val socket = DatagramSocket(DISCOVERY_PORT)
                 socket.broadcast = true
-                socket.soTimeout = 0
                 val buf    = ByteArray(1024)
                 val packet = DatagramPacket(buf, buf.size)
 
@@ -139,7 +209,9 @@ class MainActivity : AppCompatActivity() {
                     val name = json.optString("name", "TetherLink Server")
                     val res  = json.optString("resolution", "")
 
-                    // Auto-reconnect if this is the server we were connected to
+                    // Only connect via USB tethering — ignore WiFi broadcasts
+                    if (!isUsbTetherIp(ip)) continue
+
                     if (autoConnect != null && ip == autoConnect) {
                         autoConnect = null
                         withContext(Dispatchers.Main) {
@@ -157,7 +229,6 @@ class MainActivity : AppCompatActivity() {
                         discoveredIp   = ip
                         discoveredName = name
                         discoveredRes  = res
-
                         withContext(Dispatchers.Main) {
                             showProgress(false)
                             serverNameText.text = "💻  $name"
@@ -172,9 +243,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 socket.close()
             } catch (e: Exception) {
-                if (listenJob?.isActive == true) {
-                    setStatus("Discovery error: ${e.message}")
-                }
+                if (listenJob?.isActive == true) setStatus("Discovery error: ${e.message}")
             }
         }
     }
@@ -186,9 +255,11 @@ class MainActivity : AppCompatActivity() {
         streamJob = ioScope.launch {
             withContext(Dispatchers.Main) {
                 discoveryLayout.visibility = View.GONE
+                onboardingLayout.visibility = View.GONE
                 surfaceView.visibility     = View.VISIBLE
-                overlayFps.visibility      = View.VISIBLE
+                streamOverlay.visibility   = View.GONE
             }
+
             try {
                 val socket = Socket()
                 socket.connect(InetSocketAddress(ip, SERVER_PORT), 5000)
@@ -196,7 +267,6 @@ class MainActivity : AppCompatActivity() {
 
                 val streamW = input.readInt()
                 val streamH = input.readInt()
-
                 showToast("Connected to $discoveredName — ${streamW}×${streamH}")
 
                 val opts = BitmapFactory.Options().apply { inMutable = true }
@@ -224,20 +294,24 @@ class MainActivity : AppCompatActivity() {
                 socket.close()
 
             } catch (e: Exception) {
-                // ── 3. Auto-reconnect ─────────────────────────────────────────
                 val lastIp = ip
-                withContext(Dispatchers.Main) {
-                    surfaceView.visibility     = View.GONE
-                    overlayFps.visibility      = View.GONE
-                    discoveryLayout.visibility = View.VISIBLE
-                    connectButton.visibility   = View.GONE
-                    discoveredIp               = null
-                }
-                setStatus("Disconnected — reconnecting in ${AUTO_RECONNECT_DELAY_MS/1000}s…")
+                showDiscoveryScreen()
+                setStatus("Disconnected — reconnecting…")
                 delay(AUTO_RECONNECT_DELAY_MS)
-                // Pass last IP so we auto-connect when we see it broadcast again
                 startDiscoveryListener(autoConnectIp = lastIp)
             }
+        }
+    }
+
+    private fun showDiscoveryScreen() {
+        runOnUiThread {
+            surfaceView.visibility      = View.GONE
+            streamOverlay.visibility    = View.GONE
+            overlayFps.visibility       = View.GONE
+            qualityDot.visibility       = View.GONE
+            discoveryLayout.visibility  = View.VISIBLE
+            connectButton.visibility    = View.GONE
+            discoveredIp                = null
         }
     }
 
@@ -268,6 +342,15 @@ class MainActivity : AppCompatActivity() {
             fpsLastTime = now
             withContext(Dispatchers.Main) {
                 overlayFps.text = "$fps FPS"
+                // ── Connection quality dot ─────────────────────────────────
+                qualityDot.visibility = View.VISIBLE
+                qualityDot.setBackgroundResource(
+                    when {
+                        fps >= 25 -> R.drawable.dot_green
+                        fps >= 15 -> R.drawable.dot_yellow
+                        else      -> R.drawable.dot_red
+                    }
+                )
             }
         }
     }
