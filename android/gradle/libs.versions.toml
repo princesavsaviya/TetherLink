@@ -6,6 +6,7 @@ androidx-appcompat         = "1.6.1"
 material                   = "1.11.0"
 constraintlayout           = "2.1.4"
 kotlinx-coroutines-android = "1.7.3"
+zxing-android             = "4.3.0"
 
 [libraries]
 androidx-core-ktx          = { group = "androidx.core",            name = "core-ktx",                   version.ref = "androidx-core-ktx" }
@@ -13,6 +14,7 @@ androidx-appcompat         = { group = "androidx.appcompat",       name = "appco
 material                   = { group = "com.google.android.material", name = "material",                version.ref = "material" }
 androidx-constraintlayout  = { group = "androidx.constraintlayout", name = "constraintlayout",          version.ref = "constraintlayout" }
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx",   name = "kotlinx-coroutines-android", version.ref = "kotlinx-coroutines-android" }
+zxing-android             = { group = "com.journeyapps",            name = "zxing-android-embedded",     version.ref = "zxing-android" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

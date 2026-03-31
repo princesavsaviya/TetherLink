@@ -25,6 +25,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import android.content.Intent
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Base64
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 import android.content.SharedPreferences
 import org.json.JSONObject
 import java.io.DataInputStream
@@ -44,6 +49,12 @@ import java.net.Socket
 class MainActivity : AppCompatActivity() {
 
     private val SERVER_PORT             = 8080
+    private val MAGIC_HELLO             = "TLHELO".toByteArray()
+    private val MAGIC_CHALLENGE         = "TLCHAL".toByteArray()
+    private val MAGIC_RESPONSE          = "TLRESP".toByteArray()
+    private val MAGIC_OK                = "TLOK__".toByteArray()
+    private val MAGIC_REJECT            = "TLREJ_".toByteArray()
+    private val DEVICE_ID: ByteArray by lazy { getOrCreateDeviceId() }
     private val DISCOVERY_PORT          = 8765
     private val AUTO_RECONNECT_DELAY_MS = 2000L
     private val PREFS_NAME              = "tetherlink"
@@ -61,6 +72,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var serverNameText:   TextView
     private lateinit var serverInfoText:   TextView
     private lateinit var connectButton:    Button
+    private lateinit var pairButton:       Button
     private lateinit var onboardingLayout: View
 
     private lateinit var prefs: SharedPreferences
@@ -90,6 +102,7 @@ class MainActivity : AppCompatActivity() {
         serverNameText   = findViewById(R.id.serverNameText)
         serverInfoText   = findViewById(R.id.serverInfoText)
         connectButton    = findViewById(R.id.connectButton)
+        pairButton       = findViewById(R.id.pairButton)
         onboardingLayout = findViewById(R.id.onboardingLayout)
 
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -107,6 +120,10 @@ class MainActivity : AppCompatActivity() {
             streamOverlay.visibility =
                 if (streamOverlay.visibility == View.VISIBLE) View.GONE
                 else View.VISIBLE
+        }
+
+        pairButton.setOnClickListener {
+            startActivity(Intent(this, PairingActivity::class.java))
         }
 
         connectButton.setOnClickListener {
@@ -165,6 +182,33 @@ class MainActivity : AppCompatActivity() {
      * Returns true if the given IP belongs to a USB tethering interface.
      * Excludes WiFi (wlan) interfaces to enforce USB-only mode.
      */
+    private fun getOrCreateDeviceId(): ByteArray {
+        val prefs = getSharedPreferences("tetherlink_device", MODE_PRIVATE)
+        val saved = prefs.getString("device_id", null)
+        if (saved != null) return Base64.decode(saved, Base64.DEFAULT)
+        val id = java.util.UUID.randomUUID().toString().replace("-", "")
+            .substring(0, 16).toByteArray()
+        prefs.edit().putString("device_id", Base64.encodeToString(id, Base64.DEFAULT)).apply()
+        return id
+    }
+
+    private fun getStoredSecret(): ByteArray? {
+        val prefs = getSharedPreferences("tetherlink_security", MODE_PRIVATE)
+        val saved = prefs.getString("paired_secret", null) ?: return null
+        return Base64.decode(saved, Base64.DEFAULT)
+    }
+
+    fun storeSecret(secret: ByteArray) {
+        val prefs = getSharedPreferences("tetherlink_security", MODE_PRIVATE)
+        prefs.edit().putString("paired_secret", Base64.encodeToString(secret, Base64.DEFAULT)).apply()
+    }
+
+    private fun computeHmac(nonce: ByteArray, secret: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(secret, "HmacSHA256"))
+        return mac.doFinal(nonce)
+    }
+
     private fun isUsbTetherIp(ip: String): Boolean {
         return try {
             java.net.NetworkInterface.getNetworkInterfaces()
@@ -272,6 +316,42 @@ class MainActivity : AppCompatActivity() {
                 val socket = Socket()
                 socket.connect(InetSocketAddress(ip, SERVER_PORT), 5000)
                 val input = DataInputStream(socket.getInputStream())
+
+                // ── 3-way HMAC handshake ─────────────────────────────
+                val secret = getStoredSecret()
+                if (secret == null) {
+                    throw Exception("Not paired. Scan the QR code on your PC first.")
+                }
+
+                // Step 1: Send HELLO + device_id + device_name
+                val deviceName = android.os.Build.MODEL.toByteArray()
+                socket.getOutputStream().write(MAGIC_HELLO + DEVICE_ID + deviceName)
+                socket.getOutputStream().flush()
+
+                // Step 2: Receive CHALLENGE
+                val challengeHeader = ByteArray(6)
+                input.readFully(challengeHeader)
+                if (!challengeHeader.contentEquals(MAGIC_CHALLENGE)) {
+                    throw Exception("Unexpected response from server")
+                }
+                val nonce = ByteArray(16)
+                input.readFully(nonce)
+
+                // Step 3: Send HMAC response
+                val hmacBytes = computeHmac(nonce, secret)
+                socket.getOutputStream().write(MAGIC_RESPONSE + hmacBytes)
+                socket.getOutputStream().flush()
+
+                // Step 4: Receive OK or REJECT
+                val resultHeader = ByteArray(6)
+                input.readFully(resultHeader)
+                if (resultHeader.contentEquals(MAGIC_REJECT)) {
+                    throw Exception("Authentication failed — wrong key or server busy")
+                }
+                if (!resultHeader.contentEquals(MAGIC_OK)) {
+                    throw Exception("Unexpected server response")
+                }
+                // ─────────────────────────────────────────────────────────────
 
                 val streamW = input.readInt()
                 val streamH = input.readInt()

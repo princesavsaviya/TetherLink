@@ -41,4 +41,5 @@ dependencies {
     implementation(libs.material)
     implementation(libs.androidx.constraintlayout)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.zxing.android)
 }

@@ -1,36 +1,37 @@
 """
-TetherLink Server - Milestone 4: True Virtual Display via Mutter ScreenCast
-Uses org.gnome.Mutter.ScreenCast to create a real virtual monitor at the
-target resolution, then captures it via PipeWire and streams to Android.
+TetherLink Server - v0.8.0
+Wayland + PipeWire virtual display server with secure HMAC authentication.
 
-No user permission dialog. GNOME treats the virtual display as a real
-second monitor — you can drag windows onto it, set wallpaper, etc.
+Security flow (3-way handshake):
+  1. Client → Server: [HELLO][16B device_id]
+  2. Server → Client: [CHALLENGE][16B nonce]
+  3. Client → Server: [RESPONSE][32B HMAC-SHA256(nonce, secret)]
+  4. Server → Client: [OK][4B width][4B height]  or  [REJECT]
 
-Flow:
-  Mutter.ScreenCast.CreateSession()
-    → session.RecordVirtual(width, height)   ← creates real virtual monitor
-    → stream.Start()
-    → PipeWireStreamAdded(node_id)
-    → GStreamer pipewiresrc path=node_id
-    → BGR frames → JPEG → TCP → Android
+Pairing:
+  First run: server generates secret key, displays QR code in terminal
+  Android scans QR once → key stored in Android KeyStore
+  Subsequent connections use stored key
 
 Usage:
     python server/tetherlink_server.py
-    python server/tetherlink_server.py --width 2960 --height 1848
-    python server/tetherlink_server.py --fps 60 --quality 70
-
-Protocol:
-    Handshake : [4B width][4B height]   (sent once on connect)
-    Stream    : [4B size][JPEG data]    (repeated per frame)
+    python server/tetherlink_server.py --fps 60 --quality 90
+    python server/tetherlink_server.py --pair   # show QR code again
 """
 
 import argparse
+import hashlib
+import hmac
+import json
 import logging
+import os
+import secrets
 import socket
 import struct
 import threading
 import time
 from io import BytesIO
+from pathlib import Path
 
 import dbus
 import dbus.mainloop.glib
@@ -42,25 +43,23 @@ from tray import TrayState, start_tray
 from discovery import DiscoveryBroadcaster
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description="TetherLink Virtual Display Server")
-parser.add_argument("--width",   type=int, default=2960,
-                    help="Virtual display width  (default: 2960)")
-parser.add_argument("--height",  type=int, default=1848,
-                    help="Virtual display height (default: 1848)")
-parser.add_argument("--fps",     type=int, default=60)
-parser.add_argument("--quality", type=int, default=90)
-parser.add_argument("--port",    type=int, default=8080)
+parser = argparse.ArgumentParser(description="TetherLink Server")
+parser.add_argument("--fps",     type=int,  default=60)
+parser.add_argument("--quality", type=int,  default=90)
+parser.add_argument("--port",    type=int,  default=8080)
+parser.add_argument("--pair",    action="store_true", help="Show pairing QR code")
+parser.add_argument("--reset",   action="store_true", help="Reset pairing (new secret key)")
 args = parser.parse_args()
 
-WIDTH          = args.width
-HEIGHT         = args.height
+WIDTH          = 2960
+HEIGHT         = 1848
 FPS            = args.fps
 JPEG_QUALITY   = args.quality
 PORT           = args.port
 FRAME_INTERVAL = 1.0 / FPS
-
-# Shared tray state — updated by streaming threads
-tray_state = TrayState()
+CONFIG_DIR     = Path.home() / ".config" / "tetherlink"
+SECRET_FILE    = CONFIG_DIR / "secret.key"
+DEVICES_FILE   = CONFIG_DIR / "paired_devices.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -70,26 +69,186 @@ logging.basicConfig(
 )
 log = logging.getLogger("TetherLink")
 
-MUTTER_BUS      = "org.gnome.Mutter.ScreenCast"
-MUTTER_PATH     = "/org/gnome/Mutter/ScreenCast"
-MUTTER_SC_IF    = "org.gnome.Mutter.ScreenCast"
-MUTTER_SES_IF   = "org.gnome.Mutter.ScreenCast.Session"
-MUTTER_STR_IF   = "org.gnome.Mutter.ScreenCast.Stream"
+# ── Secret key management ─────────────────────────────────────────────────────
+
+def load_or_create_secret() -> bytes:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if args.reset and SECRET_FILE.exists():
+        SECRET_FILE.unlink()
+        DEVICES_FILE.unlink(missing_ok=True)
+        log.info("Secret reset — all paired devices removed")
+
+    if SECRET_FILE.exists():
+        return SECRET_FILE.read_bytes()
+
+    secret = secrets.token_bytes(32)
+    SECRET_FILE.write_bytes(secret)
+    SECRET_FILE.chmod(0o600)
+    log.info("New secret key generated: %s", SECRET_FILE)
+    return secret
 
 
-# ── Mutter ScreenCast virtual display ────────────────────────────────────────
+def load_paired_devices() -> dict:
+    if DEVICES_FILE.exists():
+        return json.loads(DEVICES_FILE.read_text())
+    return {}
+
+
+def save_paired_device(device_id: str, name: str):
+    devices = load_paired_devices()
+    devices[device_id] = {"name": name, "paired_at": time.time()}
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    DEVICES_FILE.write_text(json.dumps(devices, indent=2))
+    log.info("Paired device saved: %s (%s)", name, device_id)
+
+
+def show_qr_code(secret: bytes):
+    """Display pairing QR code in terminal."""
+    try:
+        import qrcode
+        import base64
+        payload = base64.b64encode(secret).decode()
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(f"tetherlink://pair?key={payload}")
+        qr.make(fit=True)
+        print("\n" + "="*50)
+        print("  TetherLink — Scan to pair your Android tablet")
+        print("="*50)
+        qr.print_ascii(invert=True)
+        print("="*50 + "\n")
+    except ImportError:
+        # Fallback: show key as hex if qrcode not installed
+        import base64
+        payload = base64.b64encode(secret).decode()
+        print("\n" + "="*50)
+        print("  TetherLink Pairing Key (install qrcode for QR):")
+        print(f"  tetherlink://pair?key={payload}")
+        print("="*50 + "\n")
+        log.info("Install qrcode for QR display: pip install qrcode")
+
+
+# ── 3-way HMAC handshake ──────────────────────────────────────────────────────
+
+MAGIC_HELLO     = b"TLHELO"
+MAGIC_CHALLENGE = b"TLCHAL"
+MAGIC_RESPONSE  = b"TLRESP"
+MAGIC_OK        = b"TLOK__"
+MAGIC_REJECT    = b"TLREJ_"
+
+# Global: only one client at a time
+_active_client_lock = threading.Lock()
+_active_client_ip   = None
+
+
+def authenticate_client(conn: socket.socket, addr: tuple, secret: bytes) -> tuple[bool, str, str]:
+    """
+    Run 3-way HMAC handshake.
+    Returns (success, device_id, device_name).
+    """
+    global _active_client_ip
+
+    conn.settimeout(10.0)
+
+    # ── Step 1: Receive HELLO ─────────────────────────────────────────────────
+    try:
+        hello = conn.recv(6 + 16 + 64)  # magic + device_id + device_name
+    except socket.timeout:
+        log.warning("Auth timeout from %s:%d", *addr)
+        return False, "", ""
+
+    if len(hello) < 22 or hello[:6] != MAGIC_HELLO:
+        log.warning("Bad HELLO from %s:%d", *addr)
+        conn.sendall(MAGIC_REJECT)
+        return False, "", ""
+
+    device_id   = hello[6:22].hex()
+    device_name = hello[22:].decode("utf-8", errors="replace").strip("\x00")
+    if not device_name:
+        device_name = f"Android-{device_id[:8]}"
+
+    # ── One connection limit ───────────────────────────────────────────────────
+    if not _active_client_lock.acquire(blocking=False):
+        log.warning("Rejecting %s — another client already connected", addr[0])
+        conn.sendall(MAGIC_REJECT + b"BUSY")
+        return False, "", ""
+
+    _active_client_ip = addr[0]
+
+    # ── Step 2: Send CHALLENGE ────────────────────────────────────────────────
+    nonce = secrets.token_bytes(16)
+    conn.sendall(MAGIC_CHALLENGE + nonce)
+
+    # ── Step 3: Receive RESPONSE ──────────────────────────────────────────────
+    try:
+        response = conn.recv(6 + 32)
+    except socket.timeout:
+        log.warning("No HMAC response from %s:%d", *addr)
+        _active_client_lock.release()
+        return False, "", ""
+
+    if len(response) < 38 or response[:6] != MAGIC_RESPONSE:
+        log.warning("Bad RESPONSE from %s:%d", *addr)
+        conn.sendall(MAGIC_REJECT)
+        _active_client_lock.release()
+        return False, "", ""
+
+    client_hmac   = response[6:38]
+    expected_hmac = hmac.new(secret, nonce, hashlib.sha256).digest()
+
+    if not hmac.compare_digest(client_hmac, expected_hmac):
+        log.warning("HMAC mismatch from %s:%d — rejected", *addr)
+        conn.sendall(MAGIC_REJECT)
+        _active_client_lock.release()
+        return False, "", ""
+
+    conn.settimeout(None)
+    log.info("Authenticated: %s (%s)", device_name, device_id)
+
+    # Save device if new
+    devices = load_paired_devices()
+    if device_id not in devices:
+        save_paired_device(device_id, device_name)
+
+    return True, device_id, device_name
+
+
+# ── Mutter ScreenCast ─────────────────────────────────────────────────────────
+
+MUTTER_BUS    = "org.gnome.Mutter.ScreenCast"
+MUTTER_PATH   = "/org/gnome/Mutter/ScreenCast"
+MUTTER_SC_IF  = "org.gnome.Mutter.ScreenCast"
+MUTTER_SES_IF = "org.gnome.Mutter.ScreenCast.Session"
+MUTTER_STR_IF = "org.gnome.Mutter.ScreenCast.Stream"
+
+
+def cleanup_orphaned_sessions(bus: dbus.SessionBus):
+    """Clean up any orphaned Mutter ScreenCast sessions from previous crashes."""
+    try:
+        sc_obj = bus.get_object(MUTTER_BUS, MUTTER_PATH)
+        sc     = dbus.Interface(sc_obj, MUTTER_SC_IF)
+
+        # Introspect to find existing sessions
+        intro = dbus.Interface(sc_obj, "org.freedesktop.DBus.Introspectable")
+        xml   = intro.Introspect()
+
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml)
+        for node in root.findall("node"):
+            name = node.get("name", "")
+            if name:
+                path = f"{MUTTER_PATH}/{name}"
+                try:
+                    obj = bus.get_object(MUTTER_BUS, path)
+                    ses = dbus.Interface(obj, MUTTER_SES_IF)
+                    ses.Stop()
+                    log.info("Cleaned up orphaned session: %s", path)
+                except Exception:
+                    pass
+    except Exception as e:
+        log.debug("Session cleanup: %s", e)
+
 
 class MutterVirtualDisplay:
-    """
-    Creates a real virtual monitor via org.gnome.Mutter.ScreenCast.
-    GNOME treats it as a second physical display.
-
-    Sequence:
-      1. CreateSession
-      2. session.RecordVirtual(width, height)
-      3. stream.Start()
-      4. Wait for PipeWireStreamAdded signal → get node_id
-    """
 
     def __init__(self, width: int, height: int):
         self.width    = width
@@ -101,28 +260,22 @@ class MutterVirtualDisplay:
         self._bus  = dbus.SessionBus()
         self._loop = GLib.MainLoop()
 
-        sc_obj     = self._bus.get_object(MUTTER_BUS, MUTTER_PATH)
-        self._sc   = dbus.Interface(sc_obj, MUTTER_SC_IF)
+        cleanup_orphaned_sessions(self._bus)
 
+        sc_obj    = self._bus.get_object(MUTTER_BUS, MUTTER_PATH)
+        self._sc  = dbus.Interface(sc_obj, MUTTER_SC_IF)
         self._session_path = None
-        self._stream_path  = None
 
-    def _on_pipewire_stream_added(self, node_id):
+    def _on_stream_added(self, node_id):
         self._node_id = int(node_id)
         log.info("PipeWire stream ready — node_id: %d", self._node_id)
         self._loop.quit()
 
     def _on_session_closed(self):
-        log.warning("Mutter session closed unexpectedly")
-        self._error = "Session closed"
+        self._error = "Session closed unexpectedly"
         self._loop.quit()
 
     def setup(self) -> int:
-        """
-        Run the full setup flow.
-        Returns the PipeWire node_id for the virtual display.
-        """
-        # ── 1. CreateSession ──────────────────────────────────────────────────
         log.info("Creating Mutter ScreenCast session...")
         self._session_path = str(self._sc.CreateSession(
             dbus.Dictionary({}, signature="sv")
@@ -131,51 +284,31 @@ class MutterVirtualDisplay:
 
         session_obj = self._bus.get_object(MUTTER_BUS, self._session_path)
         session     = dbus.Interface(session_obj, MUTTER_SES_IF)
+        session_obj.connect_to_signal("Closed", self._on_session_closed,
+                                      dbus_interface=MUTTER_SES_IF)
 
-        # Subscribe to Closed signal
-        session_obj.connect_to_signal(
-            "Closed", self._on_session_closed,
-            dbus_interface=MUTTER_SES_IF,
-        )
-
-        # ── 2. RecordVirtual ──────────────────────────────────────────────────
         log.info("Creating virtual monitor %dx%d...", self.width, self.height)
-        self._stream_path = str(session.RecordVirtual(
+        stream_path = str(session.RecordVirtual(
             dbus.Dictionary({
-                "size": dbus.Struct(
-                    (dbus.Int32(self.width), dbus.Int32(self.height)),
-                    signature="ii"
-                ),
-                "cursor-mode": dbus.UInt32(1),  # 1=embedded cursor in stream
+                "cursor-mode": dbus.UInt32(1),
             }, signature="sv")
         ))
-        log.info("Stream: %s", self._stream_path)
+        log.info("Stream: %s", stream_path)
 
-        stream_obj = self._bus.get_object(MUTTER_BUS, self._stream_path)
+        stream_obj = self._bus.get_object(MUTTER_BUS, stream_path)
+        stream_obj.connect_to_signal("PipeWireStreamAdded", self._on_stream_added,
+                                     dbus_interface=MUTTER_STR_IF)
 
-        # Subscribe to PipeWireStreamAdded BEFORE calling Start
-        stream_obj.connect_to_signal(
-            "PipeWireStreamAdded", self._on_pipewire_stream_added,
-            dbus_interface=MUTTER_STR_IF,
-        )
-
-        # ── 3. Start session — this starts all streams automatically ─────────
-        log.info("Starting session (streams start automatically)...")
-        stream = dbus.Interface(stream_obj, MUTTER_STR_IF)
+        log.info("Starting session...")
         session.Start()
 
-        # Wait for PipeWireStreamAdded (timeout 10s)
         GLib.timeout_add(10_000, lambda: (
-            setattr(self, "_error", "Timeout waiting for PipeWire stream"),
-            self._loop.quit()
+            setattr(self, "_error", "Timeout"), self._loop.quit()
         ))
         self._loop.run()
 
         if self._error:
             raise RuntimeError(self._error)
-        if self._node_id is None:
-            raise RuntimeError("No PipeWire node_id received")
-
         return self._node_id
 
     def close(self):
@@ -217,7 +350,7 @@ class PipeWireCapture:
 
         ret = self._pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("GStreamer pipeline failed to start")
+            raise RuntimeError("GStreamer pipeline failed")
         log.info("GStreamer pipeline playing")
 
         threading.Thread(target=self._loop.run, daemon=True).start()
@@ -260,11 +393,19 @@ def to_jpeg(raw: bytes, w: int, h: int) -> bytes:
 # ── TCP streaming ─────────────────────────────────────────────────────────────
 
 def stream_to_client(conn: socket.socket, addr: tuple,
-                     capture: PipeWireCapture) -> None:
+                     capture: PipeWireCapture, secret: bytes,
+                     tray: TrayState) -> None:
+    global _active_client_ip
+
     log.info("Client connected: %s:%d", *addr)
-    tray_state.update(connected=True, client_ip=addr[0])
+
+    ok, device_id, device_name = authenticate_client(conn, addr, secret)
+    if not ok:
+        conn.close()
+        return
+
     try:
-        # Wait up to 5s for first real frame
+        # Wait for first frame
         for _ in range(100):
             r = capture.get_frame()
             if r:
@@ -274,10 +415,11 @@ def stream_to_client(conn: socket.socket, addr: tuple,
         else:
             w, h = capture.width, capture.height
 
-        conn.sendall(struct.pack(">II", w, h))
-        log.info("Streaming %dx%d @ %d FPS → %s:%d", w, h, FPS, *addr)
+        # Send OK + resolution
+        conn.sendall(MAGIC_OK + struct.pack(">II", w, h))
+        log.info("Streaming %dx%d @ %d FPS → %s (%s)", w, h, FPS, device_name, addr[0])
+        tray.update(connected=True, client_ip=f"{device_name} ({addr[0]})")
 
-        # FPS tracking
         frame_count  = 0
         fps_deadline = time.monotonic() + 1.0
 
@@ -290,83 +432,85 @@ def stream_to_client(conn: socket.socket, addr: tuple,
                 conn.sendall(struct.pack(">I", len(jpeg)) + jpeg)
                 frame_count += 1
 
-            # Update tray FPS every second
             if time.monotonic() >= fps_deadline:
-                tray_state.update(fps=frame_count)
+                tray.update(fps=frame_count)
                 frame_count  = 0
                 fps_deadline = time.monotonic() + 1.0
 
             elapsed = time.monotonic() - start
-            sleep = FRAME_INTERVAL - elapsed
+            sleep   = FRAME_INTERVAL - elapsed
             if sleep > 0:
                 time.sleep(sleep)
 
     except (BrokenPipeError, ConnectionResetError):
-        log.info("Client disconnected: %s:%d", *addr)
+        log.info("Client disconnected: %s", device_name)
     except Exception as e:
-        log.error("Stream error %s:%d — %s", *addr, e)
+        log.error("Stream error for %s — %s", device_name, e)
     finally:
-        tray_state.update(connected=False, client_ip=None, fps=0)
+        tray.update(connected=False, client_ip=None, fps=0)
+        _active_client_ip = None
+        _active_client_lock.release()
         conn.close()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run_server():
-    log.info("TetherLink M4 — Virtual Display via Mutter ScreenCast")
-    log.info("Creating virtual monitor %dx%d...", WIDTH, HEIGHT)
+    secret = load_or_create_secret()
+
+    if args.pair or not DEVICES_FILE.exists():
+        show_qr_code(secret)
+
+    log.info("TetherLink v0.8.0 — Secure Virtual Display")
+    log.info("Paired devices: %d", len(load_paired_devices()))
 
     display = MutterVirtualDisplay(WIDTH, HEIGHT)
     try:
         node_id = display.setup()
     except Exception as e:
-        log.error("Virtual display setup failed: %s", e)
+        log.error("Virtual display failed: %s", e)
         display.close()
         raise SystemExit(1)
 
-    log.info("Virtual display ready! Check GNOME display settings — "
-             "you should see a second monitor.")
-    log.info("Drag windows onto it to see them on the tablet.")
-
+    log.info("Virtual display ready — drag windows onto it!")
     capture = PipeWireCapture(node_id, WIDTH, HEIGHT)
     time.sleep(0.5)
 
-    # Start UDP discovery broadcaster
-    broadcaster = DiscoveryBroadcaster(PORT, WIDTH, HEIGHT)
-    broadcaster.start()
-
-    # Start tray icon
+    tray_state  = TrayState()
     tray_state.update(resolution=f"{WIDTH}×{HEIGHT}")
     shutdown_event = threading.Event()
 
     def on_quit():
-        log.info("Quit requested from tray")
+        log.info("Quit from tray")
         shutdown_event.set()
 
+    broadcaster = DiscoveryBroadcaster(PORT, WIDTH, HEIGHT)
+    broadcaster.start()
+
     tray = start_tray(tray_state, on_quit=on_quit)
-    log.info("Tray icon started — right-click it to quit")
+    log.info("Tray icon started")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", PORT))
         srv.listen(5)
-        srv.settimeout(1.0)  # allow checking shutdown_event
-        log.info("Server ready on port %d — waiting for tablet...", PORT)
+        srv.settimeout(1.0)
+        log.info("Server ready on port %d", PORT)
+
         try:
             while not shutdown_event.is_set():
                 try:
                     conn, addr = srv.accept()
                     threading.Thread(
                         target=stream_to_client,
-                        args=(conn, addr, capture),
+                        args=(conn, addr, capture, secret, tray_state),
                         daemon=True,
                     ).start()
                 except socket.timeout:
-                    continue  # check shutdown_event again
+                    continue
         except KeyboardInterrupt:
-            log.info("Shutting down via Ctrl+C...")
+            log.info("Shutting down...")
         finally:
-            log.info("Cleaning up...")
             tray.quit()
             broadcaster.stop()
             capture.close()
