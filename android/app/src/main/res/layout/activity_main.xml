@@ -5,42 +5,102 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- Stream surface — sized dynamically to match server resolution -->
+    <!-- Stream surface — shown while connected -->
     <SurfaceView
         android:id="@+id/surfaceView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:layout_gravity="center" />
-
-    <!-- Loading overlay — hidden once connected -->
-    <LinearLayout
-        android:id="@+id/loadingOverlay"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
         android:layout_gravity="center"
+        android:visibility="gone" />
+
+    <!-- Discovery screen — shown while searching / server found -->
+    <LinearLayout
+        android:id="@+id/discoveryLayout"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
         android:orientation="vertical"
         android:gravity="center"
-        android:padding="24dp">
+        android:padding="48dp">
 
+        <!-- App title -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="TetherLink"
+            android:textColor="#FFFFFF"
+            android:textSize="32sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Second Screen over USB"
+            android:textColor="#88FFFFFF"
+            android:textSize="14sp"
+            android:layout_marginBottom="48dp" />
+
+        <!-- Spinner shown while scanning -->
         <ProgressBar
             android:id="@+id/progressBar"
             android:layout_width="48dp"
             android:layout_height="48dp"
-            android:indeterminate="true" />
+            android:indeterminate="true"
+            android:layout_marginBottom="16dp" />
 
+        <!-- Status message -->
         <TextView
             android:id="@+id/statusText"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
             android:text="Searching for server…"
-            android:textColor="#FFFFFF"
+            android:textColor="#AAFFFFFF"
+            android:textSize="15sp"
+            android:gravity="center"
+            android:layout_marginBottom="40dp" />
+
+        <!-- Server card — shown when server is found -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#1AFFFFFF"
+            android:padding="24dp"
+            android:layout_marginBottom="24dp">
+
+            <TextView
+                android:id="@+id/serverNameText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textColor="#FFFFFF"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="6dp" />
+
+            <TextView
+                android:id="@+id/serverInfoText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textColor="#88FFFFFF"
+                android:textSize="13sp" />
+
+        </LinearLayout>
+
+        <!-- Connect button — shown when server is found -->
+        <Button
+            android:id="@+id/connectButton"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:text="Connect"
             android:textSize="16sp"
-            android:gravity="center" />
+            android:backgroundTint="#2196F3"
+            android:visibility="gone" />
 
     </LinearLayout>
 
-    <!-- FPS counter — top-right corner, shown while streaming -->
+    <!-- FPS counter — top-right, shown while streaming -->
     <TextView
         android:id="@+id/overlayFps"
         android:layout_width="wrap_content"

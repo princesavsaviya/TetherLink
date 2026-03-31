@@ -38,6 +38,8 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst
 from PIL import Image
+from tray import TrayState, start_tray
+from discovery import DiscoveryBroadcaster
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="TetherLink Virtual Display Server")
@@ -56,6 +58,9 @@ FPS            = args.fps
 JPEG_QUALITY   = args.quality
 PORT           = args.port
 FRAME_INTERVAL = 1.0 / FPS
+
+# Shared tray state — updated by streaming threads
+tray_state = TrayState()
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -257,6 +262,7 @@ def to_jpeg(raw: bytes, w: int, h: int) -> bytes:
 def stream_to_client(conn: socket.socket, addr: tuple,
                      capture: PipeWireCapture) -> None:
     log.info("Client connected: %s:%d", *addr)
+    tray_state.update(connected=True, client_ip=addr[0])
     try:
         # Wait up to 5s for first real frame
         for _ in range(100):
@@ -271,6 +277,10 @@ def stream_to_client(conn: socket.socket, addr: tuple,
         conn.sendall(struct.pack(">II", w, h))
         log.info("Streaming %dx%d @ %d FPS → %s:%d", w, h, FPS, *addr)
 
+        # FPS tracking
+        frame_count  = 0
+        fps_deadline = time.monotonic() + 1.0
+
         while True:
             start = time.monotonic()
             r = capture.get_frame()
@@ -278,6 +288,14 @@ def stream_to_client(conn: socket.socket, addr: tuple,
                 raw, fw, fh = r
                 jpeg = to_jpeg(raw, fw, fh)
                 conn.sendall(struct.pack(">I", len(jpeg)) + jpeg)
+                frame_count += 1
+
+            # Update tray FPS every second
+            if time.monotonic() >= fps_deadline:
+                tray_state.update(fps=frame_count)
+                frame_count  = 0
+                fps_deadline = time.monotonic() + 1.0
+
             elapsed = time.monotonic() - start
             sleep = FRAME_INTERVAL - elapsed
             if sleep > 0:
@@ -288,6 +306,7 @@ def stream_to_client(conn: socket.socket, addr: tuple,
     except Exception as e:
         log.error("Stream error %s:%d — %s", *addr, e)
     finally:
+        tray_state.update(connected=False, client_ip=None, fps=0)
         conn.close()
 
 
@@ -312,24 +331,48 @@ def run_server():
     capture = PipeWireCapture(node_id, WIDTH, HEIGHT)
     time.sleep(0.5)
 
+    # Start UDP discovery broadcaster
+    broadcaster = DiscoveryBroadcaster(PORT, WIDTH, HEIGHT)
+    broadcaster.start()
+
+    # Start tray icon
+    tray_state.update(resolution=f"{WIDTH}×{HEIGHT}")
+    shutdown_event = threading.Event()
+
+    def on_quit():
+        log.info("Quit requested from tray")
+        shutdown_event.set()
+
+    tray = start_tray(tray_state, on_quit=on_quit)
+    log.info("Tray icon started — right-click it to quit")
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", PORT))
         srv.listen(5)
+        srv.settimeout(1.0)  # allow checking shutdown_event
         log.info("Server ready on port %d — waiting for tablet...", PORT)
         try:
-            while True:
-                conn, addr = srv.accept()
-                threading.Thread(
-                    target=stream_to_client,
-                    args=(conn, addr, capture),
-                    daemon=True,
-                ).start()
+            while not shutdown_event.is_set():
+                try:
+                    conn, addr = srv.accept()
+                    threading.Thread(
+                        target=stream_to_client,
+                        args=(conn, addr, capture),
+                        daemon=True,
+                    ).start()
+                except socket.timeout:
+                    continue  # check shutdown_event again
         except KeyboardInterrupt:
-            log.info("Shutting down...")
+            log.info("Shutting down via Ctrl+C...")
         finally:
+            log.info("Cleaning up...")
+            tray.quit()
+            broadcaster.stop()
             capture.close()
             display.close()
+            import os, signal
+            os.kill(os.getpid(), signal.SIGTERM)
 
 
 if __name__ == "__main__":
