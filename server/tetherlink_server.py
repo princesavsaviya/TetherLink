@@ -1,10 +1,17 @@
 """
-TetherLink Server - v0.9.0
-Wayland + PipeWire virtual display with H.264 encoding.
+TetherLink Server - v0.9.2
+Wayland + PipeWire virtual display, JPEG streaming.
+
+Resolution note:
+    Virtual display is created at --width x --height (default 1920x1080).
+    This should match your laptop's native resolution so GNOME renders UI
+    at the correct density. The GStreamer caps filter forces PipeWire to
+    negotiate this exact resolution instead of defaulting to 1280x720.
 
 Usage:
     ./server/run_server.sh
     ./server/run_server.sh --fps 60 --quality 90
+    ./server/run_server.sh --width 1920 --height 1080
     ./server/run_server.sh --codec jpeg
     ./server/run_server.sh --pair
     ./server/run_server.sh --reset
@@ -36,12 +43,12 @@ from discovery import DiscoveryBroadcaster
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="TetherLink Server")
-parser.add_argument("--width",   type=int,  default=2960)
-parser.add_argument("--height",  type=int,  default=1848)
+parser.add_argument("--width",   type=int,  default=1920)
+parser.add_argument("--height",  type=int,  default=1080)
 parser.add_argument("--fps",     type=int,  default=60)
 parser.add_argument("--quality", type=int,  default=90)
 parser.add_argument("--port",    type=int,  default=8080)
-parser.add_argument("--codec",   type=str,  default="h264",
+parser.add_argument("--codec",   type=str,  default="jpeg",
                     choices=["auto", "h264", "jpeg"])
 parser.add_argument("--pair",    action="store_true")
 parser.add_argument("--reset",   action="store_true")
@@ -312,6 +319,10 @@ class PipeWireCapture:
         else:
             pipeline_str = (
                 f"pipewiresrc path={node_id} always-copy=true "
+                # Caps filter forces PipeWire to negotiate the exact resolution
+                # with Mutter. Without this, pipewiresrc defaults to 1280x720
+                # regardless of the virtual display's actual size.
+                f"! video/x-raw,width={self.width},height={self.height},max-framerate={FPS}/1 "
                 f"! videoconvert "
                 f"! video/x-raw,format=BGR "
                 f"! appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false"
@@ -433,7 +444,7 @@ def run_server():
 
     codec = detect_codec()
 
-    log.info("TetherLink v0.9.0 — %s encoding %dx%d @ %d FPS",
+    log.info("TetherLink v0.9.2 — %s encoding %dx%d @ %d FPS",
              "H.264" if codec == CODEC_H264 else "JPEG", WIDTH, HEIGHT, FPS)
     log.info("Paired devices: %d", len(load_paired_devices()))
 
